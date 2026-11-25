@@ -236,7 +236,8 @@ export type RunningTask<I, S, R> = TaskRecord<I, S, R> & {
  */
 export type NextTaskState<S, R> =
 	| { readonly status: "running"; readonly checkpoint: S; readonly wake?: never; readonly outcome?: never }
-	| Extract<TaskState<S, R>, { readonly status: "waiting" | "sleeping" | "terminal" }>;
+	| (SleepingTaskState<S> & { readonly mode?: never })
+	| Extract<TaskState<S, R>, { readonly status: "waiting" | "terminal" }>;
 
 /**
  * Runs one checkpoint phase. It must commit a changed checkpoint or a terminal outcome through `runtime.commit()`;
@@ -361,7 +362,8 @@ export interface TaskRuntime<I, S, R, H extends object> extends DocumentObserver
 	report(error: unknown, from?: ReportFrom): void;
 	/**
 	 * Commit a sleep: the task holds no invocation until the Harness clock reaches `until`, then resumes at `checkpoint`.
-	 * Resolves once the sleep is stored, not when the time comes; the phase returns right after. Returning
+	 * Resolves once the sleep is stored, not when the time comes; the handler returns right after. A sleep committed
+	 * by an abort handler resumes that handler. Returning
 	 * `{ status: "sleeping", until, checkpoint }` from `commit()` is the same sleep, for one that must commit together
 	 * with other writes.
 	 */
@@ -380,7 +382,7 @@ export type TaskDefinition<I, S extends { phase: string }, R, H extends object> 
 	readonly phases: {
 		readonly [P in S["phase"]]: PhaseHandler<I, Extract<S, { phase: P }>, S, R, H>;
 	};
-	/** Runs in a fresh invocation after an abort mark and must commit a terminal outcome. */
+	/** Runs after an abort mark or a cancellation wake and must commit a sleep or a terminal outcome. */
 	abort(task: RunningTask<I, S, R>, runtime: TaskRuntime<I, S, R, H>, context: Context): Promise<void>;
 	/** Convert a record stored by any older supported version; runs at reservation. */
 	migrate?(
@@ -682,6 +684,15 @@ export type TaskOutcome<R> =
 			readonly reason?: never;
 	  };
 
+/** A wait for a deadline on the Harness clock, a non-empty list of signal keys, or both. */
+type SleepingTaskState<S> = {
+	readonly status: "sleeping";
+	readonly checkpoint: S;
+	readonly until?: number;
+	readonly signals?: readonly SignalKey<unknown>[];
+	readonly outcome?: never;
+};
+
 /** Complete durable execution state of a task. */
 export type TaskState<S, R> =
 	| {
@@ -710,18 +721,10 @@ export type TaskState<S, R> =
 			readonly policy: JoinPolicy;
 			readonly outcome?: never;
 	  }
-	| {
-			/**
-			 * Parked without an invocation until the Harness clock reaches `until`, in milliseconds on the
-			 * `HarnessOptions.now` clock, or one of `signals` holds a value no wake used, whichever comes first; then resumes
-			 * at `checkpoint`. Needs `until` or a non-empty `signals`. An abort mark does not wait for it.
-			 */
-			readonly status: "sleeping";
-			readonly checkpoint: S;
-			readonly until?: number;
-			readonly signals?: readonly SignalKey<unknown>[];
-			readonly outcome?: never;
-	  }
+	| (SleepingTaskState<S> & {
+			/** Set by the scheduler for a sleep that resumes cancellation. An abort mark interrupts ordinary sleep. */
+			readonly mode?: "abort";
+	  })
 	| {
 			/** Outcome decided; becomes terminal once no ordinary owned work below is live. Runs no more code. */
 			readonly status: "completing";

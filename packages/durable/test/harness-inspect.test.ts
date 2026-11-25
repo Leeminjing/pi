@@ -1,8 +1,9 @@
-import { defineTask, MemoryStorage, type TaskId, type TaskInspection } from "@earendil-works/pi-durable";
+import { defineSignal, defineTask, MemoryStorage, type TaskId, type TaskInspection } from "@earendil-works/pi-durable";
+import { str } from "@earendil-works/pi-schema";
 import { describe, expect, it } from "vitest";
 import { chatSetup, openChat, unanswered, waitFor } from "./chat-support.ts";
 import { context } from "./session-support.ts";
-import { completed, deferred, eventually, openTasks } from "./task-support.ts";
+import { abortedWith, completed, deferred, eventually, openTasks, settled } from "./task-support.ts";
 
 type Step = { phase: "run" };
 
@@ -122,7 +123,7 @@ describe("Harness.inspect()", () => {
 		});
 		expect(stateOf(running.tasks, ids.dependent)).toEqual({ kind: "waiting", on: [ids.gate] });
 		expect(running.scheduling).toBe("running");
-		expect(stateOf(running.tasks, ids.gate)).toEqual({ kind: "running" });
+		expect(stateOf(running.tasks, ids.gate)).toEqual({ kind: "running", mode: "run" });
 		expect(stateOf(running.tasks, ids.migrating)).toBeUndefined();
 		expect(stateOf(running.tasks, ids.failing)).toEqual({
 			kind: "blocked",
@@ -139,6 +140,74 @@ describe("Harness.inspect()", () => {
 			ids.tooOld,
 			ids.missing,
 		]);
+		await harness.close(context);
+	});
+
+	// #12090
+	it("reports the active invocation's mode while Stop joins the run and while cancellation parks", async () => {
+		const runStarted = deferred();
+		const runExit = deferred();
+		const abortStarted = deferred();
+		const park = deferred();
+		const Work = defineSignal({ name: "test.inspect-work", version: 1, schema: str() });
+		const Task = defineTask<null, Step, null>({
+			name: "test.inspect-cancellation",
+			version: 1,
+			initial: () => ({ phase: "run" }),
+			phases: {
+				run: async (task, runtime, ctx) => {
+					if (task.state.wake === undefined) {
+						await runtime.commit(
+							() => ({
+								status: "sleeping",
+								checkpoint: task.state.checkpoint,
+								signals: [Work.key("ready")],
+							}),
+							ctx,
+						);
+						return;
+					}
+					runStarted.resolve();
+					await runExit.promise;
+				},
+			},
+			abort: async (task, runtime, ctx) => {
+				if (task.state.wake !== undefined) return runtime.commit(() => abortedWith("done"), ctx);
+				abortStarted.resolve();
+				await park.promise;
+				await runtime.sleepUntil(500, { phase: "run" }, ctx);
+			},
+		});
+		let clock = 100;
+		const { harness } = await openTasks(new MemoryStorage(), [Task], { now: () => clock, onWake: () => {} });
+		const root = await harness.root(context);
+		const id = await root.commit((tx) => tx.createTask(Task, null, { ownership: { kind: "conversation" } }), context);
+		harness.resume();
+		await eventually(() => !harness.wake().active);
+		expect(await harness.signal(id, Work, "ready", "ready", context)).toBe("delivered");
+		await runStarted.promise;
+		expect((await harness.getTask(id, context))?.state).toMatchObject({
+			status: "running",
+			wake: { reason: "signal", signal: Work.name, key: "ready" },
+		});
+		const first = harness.abortTask(id, context);
+		await eventually(async () => (await harness.getTask(id, context))?.abortRequested === true);
+		const repeated = harness.abortTask(id, context);
+		expect(await settled(repeated)).toBe(false);
+		expect((await harness.getTask(id, context))?.state).toEqual({ status: "running", checkpoint: { phase: "run" } });
+		expect(stateOf((await harness.inspect(context)).tasks, id)).toEqual({ kind: "running", mode: "run" });
+		runExit.resolve();
+		await Promise.all([first, repeated, abortStarted.promise]);
+		expect(stateOf((await harness.inspect(context)).tasks, id)).toEqual({ kind: "running", mode: "abort" });
+		park.resolve();
+		await eventually(() => !harness.wake().active);
+		expect(stateOf((await harness.inspect(context)).tasks, id)).toEqual({
+			kind: "sleeping",
+			mode: "abort",
+			until: 500,
+		});
+		clock = 500;
+		await harness.waitForTask(id, context);
 		await harness.close(context);
 	});
 

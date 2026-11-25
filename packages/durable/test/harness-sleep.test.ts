@@ -350,7 +350,8 @@ describe("sleeping tasks", () => {
 		await harness.close(context);
 	});
 
-	it("rejects a sleep until something that is not a time, and a sleep in an abort handler", async () => {
+	// #12090
+	it("rejects invalid sleep times in run and abort handlers", async () => {
 		const errors: string[] = [];
 		const Invalid = defineTask<null, { phase: "run" } | { phase: "next" }, null>({
 			name: "test.invalid-sleep",
@@ -376,7 +377,7 @@ describe("sleeping tasks", () => {
 			phases: { run: (_task, runtime) => aborted(runtime.signal) },
 			abort: async (_task, runtime, ctx) => {
 				await runtime
-					.sleepUntil(runtime.now() + 10, { phase: "run" }, ctx)
+					.sleepUntil(-1, { phase: "run" }, ctx)
 					.catch((error: unknown) => errors.push((error as Error).message));
 				await runtime.commit(() => abortedWith("test"), ctx);
 			},
@@ -399,7 +400,7 @@ describe("sleeping tasks", () => {
 			`Task ${id} cannot sleep until NaN: not a time in milliseconds`,
 			`Task ${id} cannot sleep until -1: not a time in milliseconds`,
 			`Task ${id} cannot sleep until Infinity: not a time in milliseconds`,
-			`Abort handler of task ${aborting} cannot sleep`,
+			`Task ${aborting} cannot sleep until -1: not a time in milliseconds`,
 		]);
 		await harness.close(context);
 	});

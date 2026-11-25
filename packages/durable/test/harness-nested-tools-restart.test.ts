@@ -11,10 +11,12 @@ import {
 } from "@earendil-works/pi-ai";
 import {
 	defineExtension,
+	defineSignal,
 	defineTask,
 	defineTool,
 	type Harness,
 	LiveDoc,
+	NestedCallDoc,
 	type NestedToolExecutionResult,
 	type TaskId,
 	type ToolRegistration,
@@ -79,6 +81,90 @@ function codes(result: NestedToolExecutionResult | undefined): string[] {
 }
 
 describe("nested tool calls across a restart", () => {
+	// #12090
+	it.each(["replace", "skip"] as const)(
+		"keeps cancellation diagnostics after retiring the nested result and hooks %s",
+		async (hooks) => {
+			const path = await sqlitePath();
+			const setup = chatSetup();
+			const Ack = defineSignal({ name: "test.nested-cancel", version: 1, schema: str(), delivery: "cancellation" });
+			const evidence = {
+				severity: "warn",
+				code: "cancel_unconfirmed",
+				message: "Remote stop is unconfirmed",
+			} as const;
+			if (hooks === "skip") setup.settings.restartLimit = 1;
+			let hookCalls = 0;
+			addHooks(setup.registry, ToolTask, {
+				afterTool: async (call) => {
+					if (call.parent === undefined) return;
+					hookCalls++;
+					return { isError: true, diagnostics: [] };
+				},
+			});
+			addTool(
+				setup.registry,
+				tool("leaf", async () => ({ kind: "sleep", until: Date.now() + 100_000 }), {
+					cancel: async (_args, api) => {
+						if (api.wake === undefined) {
+							api.diagnostic(evidence);
+							return { kind: "sleep", signals: [Ack.key("stop")] };
+						}
+						throw new Error("Remote probe failed");
+					},
+				}),
+			);
+			addTool(
+				setup.registry,
+				tool("batch", async (_args, api, ctx) => {
+					await api.executeTool("leaf", {}, ctx, { key: "leaf", progress: false });
+					return {};
+				}),
+			);
+			setup.faux.setResponses([call("batch"), DONE]);
+			let { harness, root } = await open(path, setup);
+			await root.submit({ type: "input", content: "go" }, context);
+			let child: TaskId | undefined;
+			let parent: TaskId | undefined;
+			await eventually(async () => {
+				const [nested] = await nestedTasks(harness);
+				child = nested?.id;
+				parent = nested?.owner;
+				return nested?.state.status === "sleeping";
+			});
+			expect(await harness.snapshot(NestedCallDoc, parent!, "leaf", context)).toMatchObject({ taskId: child });
+			const stopping = root.abort(context);
+			await eventually(async () => {
+				const state = (await harness.getTask(child!, context))?.state;
+				return state?.status === "sleeping" && state.mode === "abort";
+			});
+			const live = await harness.snapshot(LiveDoc, root.id, context);
+			expect(live?.nestedTools?.find((slot) => slot.taskId === child)?.diagnostics).toBeUndefined();
+			expect(hookCalls).toBe(0);
+			await harness.signal(child!, Ack, "stop", "ack", context);
+			await stopping;
+			expect(hookCalls).toBe(hooks === "replace" ? 1 : 0);
+			expect((await harness.getTask(parent!, context))?.state.status).toBe("terminal");
+			expect(await harness.snapshot(NestedCallDoc, parent!, "leaf", context)).toBeUndefined();
+			await harness.close(context);
+
+			({ harness, root } = await open(path, setup));
+			const receipt = await harness.waitForTask(child!, context);
+			expect(receipt.state.outcome).toEqual({
+				status: "aborted",
+				result: {
+					kind: "nested",
+					cancellationDiagnostics: [
+						evidence,
+						{ severity: "error", code: "cancel_error", message: "Remote probe failed" },
+					],
+				},
+			});
+			expect(await harness.snapshot(NestedCallDoc, parent!, "leaf", context)).toBeUndefined();
+			await harness.close(context);
+		},
+	);
+
 	it("abandons a replay-unsafe caller's unfinished nested calls before they run again", async () => {
 		const path = await sqlitePath();
 		const setup = chatSetup();

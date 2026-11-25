@@ -661,11 +661,12 @@ type SettledTask<R> = TaskRecord<JsonValue, JsonValue, R> & {
 type TaskInspection = {
   readonly record: TaskRecord<JsonValue, JsonValue, JsonValue>;
   readonly state:
-    | { readonly kind: "running" }
+    /** Mode of the active invocation, even while Stop is joining a run. */
+    | { readonly kind: "running"; readonly mode: "run" | "abort" }
     | { readonly kind: "pending"; readonly migrates: boolean }
     | { readonly kind: "waiting"; readonly on: readonly TaskId[] }
     /** A sleep that cannot wake yet (section 5.6): `until`, when set, not reached, and no listed signal arrived. */
-    | { readonly kind: "sleeping"; readonly until?: number }
+    | { readonly kind: "sleeping"; readonly until?: number; readonly mode?: "abort" }
     /** Outcome held until its ordinary owned work drains (section 5.5). */
     | { readonly kind: "completing" }
     | {
@@ -1124,8 +1125,9 @@ is committed and any active run invocation has joined, or after a blocked task
 without live ordinary owned work has been settled as `orphaned` (section 5.4).
 The abort invocation starts once the task's ordinary owned work is no longer
 live; a `completing` task is only marked, and its final record keeps its held
-outcome with `abortRequested: true` (section 5.5). It does not await terminal
-settlement. `waitForTask()` observes
+outcome with `abortRequested: true` (section 5.5). A repeated request leaves a
+saved cancellation wait intact and still joins the active run seen on the line.
+The call leaves a paused scheduler paused. `waitForTask()` observes
 the terminal receipt. Aborting an already terminal task returns `terminal`; an
 unknown ID rejects. Explicit task abort includes a background task. Cancelling a
 task or idle wait does not abort work.
@@ -2136,6 +2138,8 @@ type TaskState<S, R> =
       readonly checkpoint: S;
       readonly until?: number;
       readonly signals?: readonly SignalKey<unknown>[];
+      /** Scheduler-owned, set when this sleep resumes the abort handler. */
+      readonly mode?: "abort";
     }
   /** Outcome decided; terminal once no ordinary owned work below is live (section 5.5). Runs no more code. */
   | { readonly status: "completing"; readonly outcome: TaskOutcome<R> }
@@ -2181,11 +2185,12 @@ type RunningTask<I, S, R> = TaskRecord<I, S, R> & {
 
 /**
  * State a task commits for itself: a replacement checkpoint, a wait, a sleep, or its outcome. A returned `terminal`
- * state becomes `completing` while ordinary owned work below is live (section 5.5). A task never writes its own `wake`.
+ * state becomes `completing` while ordinary owned work below is live (section 5.5). The scheduler owns `wake` and sleep `mode`.
  */
 type NextTaskState<S, R> =
   | { readonly status: "running"; readonly checkpoint: S; readonly wake?: never }
-  | Extract<TaskState<S, R>, { status: "waiting" | "sleeping" | "terminal" }>;
+  | (Omit<Extract<TaskState<S, R>, { status: "sleeping" }>, "mode"> & { readonly mode?: never })
+  | Extract<TaskState<S, R>, { status: "waiting" | "terminal" }>;
 
 interface HookRunner<H extends object> {
   each<K extends keyof H>(name: K, invoke: (handler: NonNullable<H[K]>) => void | Promise<void>): Promise<void>;
@@ -2345,7 +2350,7 @@ charge: async (task, runtime, context) => {
     return { status: "terminal", outcome: { status: "completed", result: { entryId: entry.id } } };
   }, context);
 },
-// The abort handler decides the outcome; returning without one faults the task.
+// The abort handler must commit a sleep or an outcome before returning.
 abort: async (task, runtime, context) => {
   await payments.cancel(task.state.checkpoint);
   await runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted", reason: "user" } }), context);
@@ -2400,8 +2405,9 @@ apply:
    was made.
 
 An abort invocation runs its abort handler once. After it settles, a step
-applies rules 1, 2, and 4; a handler that returns without a terminal outcome
-faults the task. When Storage rejects a step's fault or handover write, the
+applies rules 1, 2, and 4. A sleep or outcome that committed takes precedence over
+a later throw. A handler that returns while the task is still running faults
+the task. When Storage rejects a step's fault or handover write, the
 invocation still ends; the task stays `running` and the next reservation runs it
 again.
 
@@ -2679,7 +2685,11 @@ reason on to the ordinary owned work below; any other cancellation intent
 marks without a reason, and replaces a `restart` mark below it. A request
 (`abortTask()`, a conversation abort) replaces a `restart` mark too, so a
 restart-marked task waiting for its definition is then orphaned; an owner's own
-cleanup through `runtime.abortOwned()` keeps the mark. Abort handlers see the
+cleanup through `runtime.abortOwned()` keeps the mark. If the task has already
+committed a cancellation sleep, an explicit Stop upgrades the mark and leaves
+the wait intact. Registry changes and repeated Stops leave cancellation sleeps
+in place until their conditions are met, when resolution and migration run.
+Abort handlers see the
 reason on the task record and can tell an abandonment from a request.
 
 No task below an owner with cancellation intent starts a run phase, even
@@ -2844,10 +2854,13 @@ milliseconds on `HarnessOptions.now`, or once one of `signals` holds a value no
 wake used (section 5.7), whichever comes first. A sleep needs `until`, a
 non-empty `signals`, or both. `sleepUntil()` resolves when the sleep is stored,
 not when the time comes; the phase returns right after. `until` must be a finite
-number, `0` or more; an abort handler cannot sleep. A sleep adds no wait-for
-edge. An abort mark ends it: the abort handler runs once the task's owned work
-drains, without waiting for its signals or `until`. Open keeps sleeping tasks
-asleep, and their deadlines survive any number of reopens. Code that reads
+number, `0` or more. A sleep adds no wait-for edge. A fresh abort mark interrupts
+an ordinary sleep. The abort handler starts once the task's owned work drains,
+and can commit a sleep with cancellation signal keys or a deadline. The scheduler
+stores that sleep with `mode: "abort"` and resumes the abort handler when it
+wakes. A sleep without `mode` is an ordinary sleep, including on records saved
+before cancellation sleeps were introduced. Open keeps a cancellation wait
+without incrementing the task's restart count. Code that reads
 `until` of a sleeping task handles its absence.
 
 There is no sleep inside a phase: a phase reruns from its top after a crash or
@@ -2887,7 +2900,9 @@ writes its `wake` (section 5.1):
 - a wait gets `tasks`: with `any` the terminal tasks of `on` at the
   reservation, otherwise all of `on`.
 
-An abort invocation gets no wake. Reconciliation at open and close, and
+The first abort mark removes any stored business wake from the task's state
+while preserving its checkpoint. An abort invocation can receive a wake
+from a cancellation sleep. Reconciliation at open and close, and
 handover, write the task back as `pending` with its checkpoint and its `wake`,
 which the next reservation keeps, so a phase that reruns after a crash or a
 close reads the same wake. The wake stays until the task commits a different
@@ -2917,7 +2932,7 @@ paused, when the Session next needs a running process:
   blocked, a running invocation, a waiting task whose `on` is settled (with
   `any`, one of whose tasks is terminal), a sleep that can wake (due, or a
   listed key holding a value no wake used), or an abort-marked task whose owned
-  work drained; also while a
+  work drained and whose cancellation wait, if any, can wake; also while a
   reconcile pass (section 5.5) is scheduled or underway, such as open's
   recovery, since it may finalize held outcomes and mark cascades. A host keeps a
   recovery wakeup armed while it is set, so work cut off by a crash resumes.
@@ -2962,6 +2977,7 @@ function defineSignal<S extends object>(definition: {
   readonly version: number;
   /** A pi-schema schema of a JSON value; the value type is `Static<S>`. */
   readonly schema: S;
+  readonly delivery?: "cancellation";
   /** A value stored by an older version, to the current shape. */
   readonly migrate?: (value: JsonValue, fromVersion: number) => Static<S>;
 }): SignalToken<Static<S>>;
@@ -2969,12 +2985,18 @@ function defineSignal<S extends object>(definition: {
 interface SignalToken<T> {
   readonly name: string;
   readonly version: number;
+  readonly delivery?: "cancellation";
   /** The key of one wait; throws for an empty key. */
   key(key: string): SignalKey<T>;
 }
 
-/** JSON: the token's name and the wait's key. `T` is a phantom type. */
-type SignalKey<T> = { readonly signal: string; readonly key: string; readonly "~value"?: T };
+/** JSON: the token's name and delivery scope and the wait's key. `T` is a phantom type. */
+type SignalKey<T> = {
+  readonly signal: string;
+  readonly key: string;
+  readonly delivery?: "cancellation";
+  readonly "~value"?: T;
+};
 
 /** A key's state: the value delivered under it, or expired because its sleep's deadline came first. */
 type SignalState<T> = { readonly kind: "value"; readonly value: T } | { readonly kind: "expired" };
@@ -2992,18 +3014,23 @@ integer, and a schema that admits non-JSON values (pi-schema's `bigint()`,
 **Delivery.** `tx.signal(taskId, token, key, value)` reads the task record and,
 in order, returns:
 
-1. `not_found` for no task; `closed` for a terminal, `completing`, or
-   abort-marked task;
+1. `not_found` for no task. `closed` for a terminal or `completing` task, for
+   ordinary delivery after an abort mark, or for cancellation delivery before
+   an abort mark.
 2. `invalid` for an empty key, or a value that is not JSON or does not match
    the token's schema;
 3. `duplicate` when the key holds a value, consumed or not; `closed` when it is
    expired;
-4. `closed` when the task sleeps on this key and its `until` has passed; the
-   key is marked expired in the same commit;
+4. `closed` when the task sleeps on this exact delivery scope, signal and key
+   and the clock is at or past its `until`. The key is marked expired in the
+   same commit.
 5. otherwise `delivered`: it stores the value with the token's version.
 
-The task need not sleep on the key yet: a value delivered while it runs, or
-sleeps on other keys, is kept, and a later sleep on that key wakes at once.
+The task can receive a signal before it sleeps, including a cancellation
+confirmation received after Stop and before the first abort invocation.
+A later sleep on that key wakes at once, even if its deadline already passed.
+Each sleep accepts keys for its own delivery scope. A consumed or expired key
+cannot serve another wait.
 `delivered` means durably accepted, not consumed: the task may end without
 waiting on the key. Like `admit(tx)`, `tx.signal()` comes before the commit's
 first table write and throws `ReadAfterWrite` after it, and its result is
@@ -3011,7 +3038,9 @@ provisional until the commit is stored. `Harness.signal()` runs it in a commit
 of its own (section 2.2). Neither checks who calls it.
 
 **Storage.** A key's state lives in the task's memos (section 5.2) under
-`pi.signal.<signal name>/<key>`: `{ version, value }`, with `consumed: true`
+`pi.signal.<signal name>/<key>` for ordinary delivery or
+`pi.cancel-signal.<signal name>/<key>` for cancellation delivery. It holds
+`{ version, value }`, with `consumed: true`
 once a wake used it, or `{ expired: true }`. Signal names contain no `/`, so
 names never collide; the `pi.` memo prefix belongs to the Harness. Memos have
 the lifetime a signal needs: kept through checkpoints, reconciliation,
@@ -3021,8 +3050,9 @@ and expired marks, a state change) keeps the memos of the transaction's latest
 candidate of that record, so no write erases another; a terminal or
 `completing` replacement drops them as before.
 
-**Reading.** `readSignal(token, key, context)` of `TaskRuntime`, `HookApi`, and
-`ToolExecutionApi` returns the key's committed state in the asking task, or
+**Reading.** `readSignal(token, key, context)` on `TaskRuntime`, `HookApi`,
+`ToolExecutionApi`, and `ToolCancelApi` returns the key's committed state in the
+asking task, using the token's delivery scope even in an abort invocation, or
 `undefined` while nothing came; it never waits. A value stored by an older
 version is migrated with `migrate` and checked against the schema; a missing or
 throwing `migrate`, an invalid result, or a stored version newer than the
@@ -3954,7 +3984,7 @@ interface ToolExecutionApi<TDetails extends JsonValue = JsonValue, C extends Jso
   readonly taskId: TaskId;
   readonly conversationId: ConversationId;
   readonly callId: string;
-  /** Why this run started after a park; undefined on a fresh call and in `cancel`. */
+  /** Why this execution started after a park; undefined on a fresh call. */
   readonly wake: WakeReason | undefined;
   /** What the call last parked with; undefined on a fresh call or after a park without one. */
   readonly checkpoint: C | undefined;
@@ -4026,10 +4056,30 @@ type NestedToolExecutionResult = {
   readonly durationMs?: number;
 };
 
+type ToolCancelPark<K extends JsonValue = JsonValue> = Extract<ToolPark<K>, { readonly kind: "sleep" }>;
+
+type ToolCancelApi<
+  D extends JsonValue = JsonValue,
+  C extends JsonValue = JsonValue,
+  K extends JsonValue = JsonValue,
+> = Omit<ToolExecutionApi<D, C>, "executeTool" | "createTask" | "wake"> & (
+  | {
+      readonly reason: "abort";
+      readonly cancelCheckpoint: K | undefined;
+      readonly wake: Extract<WakeReason, { readonly reason: "signal" | "time" | "expired" }> | undefined;
+    }
+  | {
+      readonly reason: "interrupted" | "refused_park";
+      readonly cancelCheckpoint: undefined;
+      readonly wake: undefined;
+    }
+);
+
 type ToolRegistration<
   TParameters extends object = object,
   TDetails extends JsonValue = JsonValue,
   C extends JsonValue = JsonValue,
+  K extends JsonValue = JsonValue,
 > = Tool<TParameters> & {
   readonly replay?: "safe" | "unsafe";
   readonly executionMode?: ToolExecutionMode;
@@ -4051,13 +4101,20 @@ type ToolRegistration<
     context: Context,
   ): Promise<ToolExecutionResult<TDetails> | ToolPark<C>>;
   /** Clean up the external work of a call that parked while no code of the tool runs (section 8.4). */
-  cancel?(args: Static<TParameters>, api: ToolExecutionApi<TDetails, C>, context: Context): Promise<void>;
+  cancel?(
+    args: Static<TParameters>,
+    api: ToolCancelApi<TDetails, C, K>,
+    context: Context,
+  ): Promise<void | ToolCancelPark<K>>;
 };
 
-/** Identity function that infers `TParameters` from `parameters`, `TDetails` from the reported details; `C` types parks. */
-function defineTool<TParameters extends object, TDetails extends JsonValue = JsonValue, C extends JsonValue = JsonValue>(
-  tool: ToolRegistration<TParameters, TDetails, C>,
-): ToolRegistration<TParameters, TDetails, C>;
+/** Identity function that preserves parameters, details, and both checkpoint types. */
+function defineTool<
+  TParameters extends object,
+  TDetails extends JsonValue = JsonValue,
+  C extends JsonValue = JsonValue,
+  K extends JsonValue = JsonValue,
+>(tool: ToolRegistration<TParameters, TDetails, C, K>): ToolRegistration<TParameters, TDetails, C, K>;
 ```
 
 `execute()` receives `args` typed by `parameters`: the Harness validates the
@@ -4099,13 +4156,14 @@ replay-unsafe call parked or not started yet when the restart came wakes as
 usual and keeps them (section 5.4's owner rule). With `progress: false`, a nested call
 commits only its status to its slot, no running output, details, or
 diagnostics; its result still carries its details and diagnostics, and a
-schema-less tool's output as `structuredOutput`, but an interrupted or aborted
-call, whose result is built from its slot, then has none of them. Programs
+schema-less tool's output as `structuredOutput`. Interrupted and aborted calls
+build their results from the slot, with cancellation diagnostics preserved
+independently. Programs
 never get the partial output of an interrupted or aborted call. Nothing bounds how
 deeply calls nest; `callers` keeps a tool from being called by tools at all.
 
-The nested call's result does not go into its receipt, which stays
-`{ kind: "nested" }`. Its terminal commit writes the result as `result` into
+The nested call's receipt holds `{ kind: "nested", cancellationDiagnostics? }`.
+Its terminal commit also writes the result as `result` into
 its `NestedCallDoc` member and sets its
 slot's `summary` (`isError`, `durationMs`, `usage`, bounded error text). The
 stored result is exactly what `executeTool()` returns: it keeps no `output`,
@@ -4200,16 +4258,23 @@ const research = defineTool<typeof ResearchParameters, JsonValue, ResearchCheckp
 });
 ```
 
-`cancel` cleans up the external work of a call that parked while no code of
-the tool runs: the abort handler runs it for a call parked, or woken and cut
-off before it parked again, and recovery runs it before an `interrupted`
-result of a woken run (section 8.4). In `cancel`, `api.wake` is undefined,
-`api.checkpoint` is the last park's, and `executeTool()` and `createTask()`
-throw. It may run more than once (after the tool's own abort handling, on
-every abort attempt), so it is idempotent; a throw is reported, and the call
-still ends. It does not run for a call parked at its gates, which ran no tool
-code, nor for a first run cut off before it parked: that work is found only
-through the tool's own idempotency key, memoized before the external call.
+`cancel` for a call parked or woken from a park gets `reason: "abort"` inside
+the abort handler (section 8.4). `api.checkpoint` keeps the last business
+checkpoint. The next cancellation attempt reads its saved progress in
+`api.cancelCheckpoint` and the reason it resumed in `api.wake`. Both are
+undefined at the first attempt. Cancellation can sleep on its own signal keys
+or a deadline and returns void to settle. Use a stable idempotency key when
+requesting the stop, since a crash between the request and the park can cause
+the request to be repeated.
+
+`reason: "interrupted"` is temporary cleanup of an unsafe execution that
+crashed or closed after waking from a park. `reason: "refused_park"` is temporary
+cleanup in an ordinary invocation whose park commit lost to Stop. It receives
+that park's temporary business checkpoint. Both temporary reasons have no
+cancellation checkpoint or wake and require a void return. A returned park is
+reported as `invalid_cancel_park`. `executeTool()` and `createTask()` are
+unavailable in `cancel`. A call sleeping at its gates or interrupted before its
+first park remains subject to the ordinary execution interruption rules.
 
 ```ts
 const HOUR = 60 * 60 * 1000;
@@ -4468,11 +4533,12 @@ a tool without replacing it. Each resolution composes the winning tool of that
 name with the selected extensions' wrappers (section 7.1); a wrapper never
 captures a base, so reloading the base keeps its wrappers. The composite
 supplies the declaration, argument validation, replay policy, and execution.
-Wrappers decorate execution and never park: the Harness hands each wrapper a
-base whose `execute()` records every park it returns in the run's `api`, which
-a wrapper passes on unchanged or spread, and a park the composite returns that
-its base did not return becomes an `invalid_park` result. A wrapper that maps
-results passes a park through unchanged.
+Wrappers pass through parks their base returned during the same attempt.
+`execute()` and `cancel()` track parks separately in the invocation API, which a
+wrapper can pass unchanged or spread. A different park object or one reused
+from another attempt ends the call with `invalid_park` or
+`invalid_cancel_park`. A base without `cancel()` has no cancellation handler
+to forward.
 
 A tool call is accepted only if its request offered the tool. Generation checks
 this against the tool set replayed from the committed model context through the
@@ -5772,21 +5838,33 @@ Below, `{ entryId }` is a model-issued call's result.
 - The abort handler first runs `cancel` when the checkpoint is `parked`, or
   `execute` with `wake` (a woken run that was cut off, aborted before
   `execute()` was entered, or abort-marked after a restart), on every attempt;
-  for a tool that no longer resolves it reports that the call was not
-  cancelled. It then commits an `aborted` error result from the slot's durable
-  partial output, details, and diagnostics, after the `afterTool` chain, and ends
+  a sleep saves the original business checkpoint, a `cancellation` continuation
+  with the new checkpoint and diagnostics, the slot's sleeping status, and the
+  cancellation wait in one transaction. It keeps the same task, owner and run.
+  The first durable cancel attempt starts without a wake. A later attempt
+  resumes only cancellation, even after reopen. Tool task definition version
+  5 adds the optional continuation. Version 4 business checkpoints retain
+  their meaning.
+- A call finishes cancellation with an `aborted` error result from the slot's
+  durable partial output, details, and diagnostics, after the `afterTool` chain, and ends
   `aborted` with `{ entryId }`. A restart mark's message names the phase the
   call was in: interrupted in `execute`, parked in `parked`, not started in
   `call`. A `cancel` that hangs holds Stop, as a slow `afterTool` does. The scheduler faults a task whose abort handler
   was cut off `restartLimit` times, without a result (section 5.4), so the last
-  attempt it runs, at `restartLimit - 1` restarts, skips the chain.
+  attempt it runs, at `restartLimit - 1` restarts, skips the chain. A thrown
+  cancellation or environment error adds `cancel_error`. An invalid return
+  adds `invalid_cancel_park`. An eligible call whose tool is unavailable, or a
+  saved continuation whose handler disappeared, adds `cancel_unavailable`.
+  A normal close preserves the last commit. Cancellation diagnostics are
+  added to the final transcript result or nested receipt after hook
+  replacement, including when progress is disabled or hooks are skipped.
 - Each run of `execute()` starts with empty output; details and diagnostics
   stay in the slot across a park and its next run, which adds to them, so a
   result that omits `details` gets the newest value and the result's
   diagnostics are the slot's. A nested call with `progress: false` writes none
-  to its slot, so none carry over. `beforeTool` runs before intent and never
-  again once intent is committed; `afterTool` runs on the final result; neither
-  sees a park.
+  to its slot. `beforeTool` runs before intent and never again once intent is
+  committed. `afterTool` runs at settlement and may run again after a crash
+  before that commit. A park produces no final result.
 - Every result the task writes passes the `afterTool` chain: the slot is read
   before the result commit, since hooks run outside commits, and does not change
   while the tool does not run. A result the Harness wrote itself is then bounded
@@ -6514,7 +6592,8 @@ type TaskGraphState =
       readonly status: "sleeping";
       readonly phase: string;
       readonly until?: number;
-      readonly signals?: readonly { readonly signal: string; readonly key: string }[];
+      readonly signals?: readonly Pick<SignalKey<unknown>, "signal" | "key" | "delivery">[];
+      readonly mode?: "abort";
     }
   /** Outcome held until its ordinary owned work drains (section 5.5). */
   | { readonly status: "completing"; readonly outcome: TaskOutcome<JsonValue>["status"] };

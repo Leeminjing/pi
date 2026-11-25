@@ -124,6 +124,8 @@ export type {
 	Submission,
 	SubmissionDraft,
 	TaskInspection,
+	ToolCancelApi,
+	ToolCancelPark,
 	ToolControl,
 	ToolDiagnostic,
 	ToolExecutionApi,

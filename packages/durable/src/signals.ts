@@ -17,12 +17,18 @@ import type { SettledSubmissionRecord } from "./harness/types.ts";
 import type { SubmissionRecord, TaskRecord, TaskState, WakeReason } from "./types.ts";
 
 /** The key of one wait for a signal: JSON, used in sleeps and parks. `T` is a phantom type. */
-export type SignalKey<T> = { readonly signal: string; readonly key: string; readonly "~value"?: T };
+export type SignalKey<T> = {
+	readonly signal: string;
+	readonly key: string;
+	readonly delivery?: "cancellation";
+	readonly "~value"?: T;
+};
 
 /** A signal kind, built by `defineSignal()`: values of type `T` delivered under keys. */
 export interface SignalToken<T> {
 	readonly name: string;
 	readonly version: number;
+	readonly delivery?: "cancellation";
 	/** The key of one wait; throws for an empty key. */
 	key(key: string): SignalKey<T>;
 }
@@ -35,6 +41,8 @@ export type SignalDefinition<S extends object> = {
 	readonly version: number;
 	/** A pi-schema schema of a JSON value; the value type is `Static<S>`. */
 	readonly schema: S;
+	/** Receive only after the target task is abort-marked. Omit for ordinary delivery. */
+	readonly delivery?: "cancellation";
 	/** A value stored by an older version, to the current shape. */
 	readonly migrate?: (value: JsonValue, fromVersion: number) => Static<S>;
 };
@@ -44,14 +52,13 @@ export type SignalState<T> = { readonly kind: "value"; readonly value: T } | { r
 
 /**
  * What a delivery did: `delivered` (durably accepted, not necessarily consumed), `duplicate` (the key holds a value),
- * `invalid` (not JSON, or not matching the schema), `closed` (the task ended, holds its outcome, is abort-marked, or the
- * key expired), `not_found` (no such task).
+ * `invalid` (not JSON, or not matching the schema), `closed` (the task ended, holds its outcome, has a different
+ * delivery scope, or the key expired), `not_found` (no such task).
  */
 export type SignalResult = "delivered" | "duplicate" | "invalid" | "closed" | "not_found";
 
 /**
- * Stored state of one key, in the task's memo `pi.signal.<name>/<key>`, told apart by `expired`: the stored shape stays
- * as records already hold it.
+ * Stored state of one key in its delivery scope's task memos, told apart by `expired`.
  */
 type SignalMemo = (ValueMemo & { readonly expired?: never }) | { readonly expired: true };
 
@@ -72,19 +79,21 @@ const internals = new WeakMap<SignalToken<unknown>, SignalInternals>();
 
 /** Define a signal kind. Throws for a name with "/", a version that is not a positive integer, or a non-JSON schema. */
 export function defineSignal<S extends object>(definition: SignalDefinition<S>): SignalToken<Static<S>> {
-	const { name, version, schema } = definition;
+	const { name, version, schema, delivery } = definition;
 	if (name === "" || name.includes("/"))
 		throw new TypeError(`Signal name ${JSON.stringify(name)} must be non-empty, without "/"`);
 	if (!Number.isInteger(version) || version < 1)
 		throw new TypeError(`Signal ${name} version must be a positive integer`);
 	const nonJson = nonJsonType(schema);
 	if (nonJson !== undefined) throw new TypeError(`Signal ${name} schema admits non-JSON values (${nonJson})`);
+	const scope = delivery === undefined ? {} : { delivery };
 	const token: SignalToken<Static<S>> = {
 		name,
 		version,
+		...scope,
 		key: (key) => {
 			if (key === "") throw new TypeError(`Signal ${name} key must be non-empty`);
-			return { signal: name, key };
+			return { signal: name, key, ...scope };
 		},
 	};
 	internals.set(token, { validator: compile(schema), migrate: definition.migrate });
@@ -187,8 +196,9 @@ export function isSettled(record: SubmissionRecord): record is SettledSubmission
 }
 
 /** The memo holding a key's state. Signal names contain no "/", so names never collide. */
-function signalMemoName(signal: string, key: string): string {
-	return `pi.signal.${signal}/${key}`;
+function signalMemoName({ signal, key, delivery }: SignalKey<unknown>): string {
+	const prefix = delivery === "cancellation" ? "pi.cancel-signal." : "pi.signal.";
+	return `${prefix}${signal}/${key}`;
 }
 
 /**
@@ -204,18 +214,23 @@ export function deliverSignal<T>(
 ): { readonly result: SignalResult; readonly record?: AnyTaskRecord } {
 	if (record === undefined) return { result: "not_found" };
 	const state = record.state;
-	if (state.status === "terminal" || state.status === "completing" || record.abortRequested)
+	if (
+		state.status === "terminal" ||
+		state.status === "completing" ||
+		record.abortRequested !== (token.delivery === "cancellation")
+	) {
 		return { result: "closed" };
+	}
 	// Values come from outside: the trust boundary of the signal's schema.
 	if (key === "" || !isJsonValue(value) || !internalsOf(token).validator.check(value)) return { result: "invalid" };
-	const name = signalMemoName(token.name, key);
+	const name = signalMemoName({ signal: token.name, key, delivery: token.delivery });
 	const stored = memoOf(record.memos, name);
 	if (stored !== undefined) return { result: stored.expired === true ? "closed" : "duplicate" };
 	if (
 		state.status === "sleeping" &&
 		state.until !== undefined &&
 		state.until <= now &&
-		state.signals?.some((listed) => listed.signal === token.name && listed.key === key) === true
+		state.signals?.some((listed) => signalMemoName(listed) === name) === true
 	) {
 		return { result: "closed", record: withMemos(record, { [name]: { expired: true } }) };
 	}
@@ -233,7 +248,7 @@ export function readSignal<T>(
 	token: SignalToken<T>,
 	key: string,
 ): SignalState<T> | undefined {
-	const stored = memoOf(memos, signalMemoName(token.name, key));
+	const stored = memoOf(memos, signalMemoName({ signal: token.name, key, delivery: token.delivery }));
 	if (stored === undefined) return undefined;
 	if (stored.expired === true) return { kind: "expired" };
 	if (stored.version === token.version) return { kind: "value", value: stored.value as T };
@@ -254,8 +269,16 @@ export function checkSleep(state: Sleeping, memos: Memos | undefined, task: numb
 	if (state.until === undefined && (state.signals === undefined || state.signals.length === 0)) {
 		throw new Error(`Task ${task} cannot sleep without until or signals`);
 	}
-	for (const { signal, key } of state.signals ?? []) {
-		const stored = memoOf(memos, signalMemoName(signal, key));
+	const delivery = state.mode === "abort" ? "cancellation" : undefined;
+	for (const address of state.signals ?? []) {
+		const { signal, key } = address;
+		if (signal === "" || signal.includes("/") || key === "") {
+			throw new Error(`Task ${task} cannot sleep on an invalid signal address: ${signal}/${key}`);
+		}
+		if (address.delivery !== delivery) {
+			throw new Error(`Task ${task} cannot sleep on signal ${signal} key ${key}: wrong delivery scope`);
+		}
+		const stored = memoOf(memos, signalMemoName(address));
 		if (stored === undefined) continue;
 		if (stored.expired === true)
 			throw new Error(`Task ${task} cannot sleep on signal ${signal} key ${key}: it expired`);
@@ -282,7 +305,7 @@ export function sleepWake(
 ): { readonly wake: WakeReason; readonly memos: Memos } | undefined {
 	const ready = readyKey(state, memos);
 	if (ready !== undefined) {
-		const name = signalMemoName(ready.signal, ready.key);
+		const name = signalMemoName(ready);
 		// `readyKey()` found a value there.
 		const consumed: ValueMemo = { ...(memoOf(memos, name) as ValueMemo), consumed: true };
 		return { wake: { reason: "signal", signal: ready.signal, key: ready.key }, memos: { [name]: consumed } };
@@ -290,20 +313,17 @@ export function sleepWake(
 	if (state.until === undefined || state.until > now) return undefined;
 	if (state.signals === undefined || state.signals.length === 0) return { wake: { reason: "time" }, memos: {} };
 	const expired: Record<string, JsonValue> = {};
-	for (const { signal, key } of state.signals) {
-		const name = signalMemoName(signal, key);
+	for (const address of state.signals) {
+		const name = signalMemoName(address);
 		if (memoOf(memos, name) === undefined) expired[name] = { expired: true };
 	}
 	return { wake: { reason: "expired" }, memos: expired };
 }
 
 /** The first listed key, in `signals` order, holding a value no wake used. */
-function readyKey(
-	state: Sleeping,
-	memos: Memos | undefined,
-): { readonly signal: string; readonly key: string } | undefined {
-	return state.signals?.find(({ signal, key }) => {
-		const stored = memoOf(memos, signalMemoName(signal, key));
+function readyKey(state: Sleeping, memos: Memos | undefined): SignalKey<unknown> | undefined {
+	return state.signals?.find((address) => {
+		const stored = memoOf(memos, signalMemoName(address));
 		return stored !== undefined && stored.expired !== true && stored.consumed !== true;
 	});
 }

@@ -1,4 +1,5 @@
 import type { Context } from "@earendil-works/chord/context";
+import { obj, str } from "@earendil-works/pi-schema";
 import { expect, expectTypeOf, it } from "vitest";
 import { idFromNumber, seqFromNumber } from "../src/ids.ts";
 import type {
@@ -9,6 +10,7 @@ import type {
 	DocumentId,
 	DocumentRecord,
 	EntryId,
+	NextTaskState,
 	StorageWrite,
 	SubmissionCreate,
 	SubmissionId,
@@ -22,8 +24,10 @@ import {
 	type AnyTask,
 	type CompactionResult,
 	type Conversation,
+	createRegistry,
 	defineExtension,
 	defineTask,
+	defineTool,
 	type Extension,
 	type Harness,
 	type HookApi,
@@ -32,6 +36,10 @@ import {
 	type SettledTask,
 	type SubmissionDraft,
 	type TaskRuntime,
+	type ToolCancelApi,
+	type ToolCancelPark,
+	type ToolRegistration,
+	wrapTool,
 } from "../src/index.ts";
 
 declare const callContext: Context;
@@ -45,6 +53,66 @@ const documentId = idFromNumber<DocumentId>(6);
 const seq = seqFromNumber(1);
 
 type TaskResult<I> = I extends TaskId<infer R> ? R : never;
+
+// #12090
+it("keeps the tool's cancellation types through definition, wrapping and registration", () => {
+	const parameters = obj({ job: str() });
+	type Details = { attempt: number };
+	type Work = { jobId: string };
+	type Cancellation = { requestId: string };
+	type Registration = ToolRegistration<typeof parameters, Details, Work, Cancellation>;
+	const tool = defineTool<typeof parameters, Details, Work, Cancellation>({
+		name: "test-cancel",
+		description: "test",
+		parameters,
+		execute: async (args, api) => {
+			expectTypeOf(args.job).toEqualTypeOf<string>();
+			expectTypeOf(api.checkpoint).toEqualTypeOf<Work | undefined>();
+			return { details: { attempt: 1 } };
+		},
+		cancel: async (_args, api) => {
+			expectTypeOf(api).toEqualTypeOf<ToolCancelApi<Details, Work, Cancellation>>();
+			expectTypeOf(api.checkpoint).toEqualTypeOf<Work | undefined>();
+			if (api.reason === "abort") {
+				expectTypeOf(api.cancelCheckpoint).toEqualTypeOf<Cancellation | undefined>();
+				expectTypeOf(api.wake?.reason).toEqualTypeOf<"signal" | "time" | "expired" | undefined>();
+				return { kind: "sleep", until: 400, checkpoint: { requestId: "stop" } };
+			}
+			expectTypeOf(api.reason).toEqualTypeOf<"interrupted" | "refused_park">();
+			expectTypeOf(api.cancelCheckpoint).toEqualTypeOf<undefined>();
+			expectTypeOf(api.wake).toEqualTypeOf<undefined>();
+			const prohibited = () => {
+				// @ts-expect-error cancellation cannot create tasks through the tool convenience API
+				void api.createTask;
+				// @ts-expect-error cancellation cannot execute nested tools through the tool convenience API
+				void api.executeTool;
+			};
+			expectTypeOf(prohibited).toBeFunction();
+		},
+	});
+	const registry = createRegistry<Registration>();
+	const wrapper = wrapTool(tool, (base) => {
+		expectTypeOf(base).toEqualTypeOf<Registration>();
+		return { ...base, cancel: (args, api, ctx) => base.cancel!(args, { ...api }, ctx) };
+	});
+	registry.install(defineExtension({ name: "cancellation", tools: [tool], wraps: [wrapper] }));
+	expectTypeOf(registry.snapshot().tools()[0]!.tool).toEqualTypeOf<Registration>();
+	const prohibited = () => {
+		// @ts-expect-error cancellation cannot durably join tasks
+		const wait: ToolCancelPark<Cancellation> = { kind: "wait", on: [], policy: "allSettled" };
+		// @ts-expect-error a cancellation sleep cannot carry a result
+		const output: ToolCancelPark<Cancellation> = { kind: "sleep", until: 400, output: [] };
+		const state: NextTaskState<Work, undefined> = {
+			status: "sleeping",
+			checkpoint: { jobId: "1" },
+			until: 1,
+			// @ts-expect-error mode is assigned by the scheduler
+			mode: "abort",
+		};
+		void [wait, output, state];
+	};
+	expectTypeOf(prohibited).toBeFunction();
+});
 
 it("brands numeric IDs by record kind and carries task result types", () => {
 	expect(typeof conversationId).toBe("number");

@@ -22,6 +22,12 @@ import { ControlledStorage, context } from "./session-support.ts";
 import { aborted, abortedWith, completed, eventually, openTasks } from "./task-support.ts";
 
 const Answer = defineSignal({ name: "test.answer", version: 1, schema: obj({ text: str() }) });
+const CancelAnswer = defineSignal({
+	name: Answer.name,
+	version: 1,
+	schema: obj({ text: str() }),
+	delivery: "cancellation",
+});
 
 type AskInput = { readonly keys: readonly string[]; readonly until?: number };
 type AskState = { phase: "ask" } | { phase: "answered" };
@@ -96,6 +102,190 @@ describe("defineSignal", () => {
 		).not.toThrow();
 		expect(() => Answer.key("")).toThrow(/non-empty/);
 		expect(Answer.key("k")).toEqual({ signal: "test.answer", key: "k" });
+	});
+});
+
+describe("cancellation signal delivery", () => {
+	// #12090
+	it("isolates equal addresses and accepts confirmations before reservation and within the park commit", async () => {
+		let clock = 100;
+		let harness: Awaited<ReturnType<typeof openTasks>>["harness"];
+		const Task = defineTask<null, { phase: "run" | "parked" }, string>({
+			name: "test.cancel-answer",
+			version: 1,
+			initial: () => ({ phase: "run" }),
+			phases: {
+				run: async (_task, runtime, ctx) => {
+					await expect(
+						runtime.commit(
+							() => ({
+								status: "sleeping",
+								checkpoint: { phase: "parked" },
+								signals: [CancelAnswer.key("same")],
+							}),
+							ctx,
+						),
+					).rejects.toThrow(/wrong delivery scope/);
+					await runtime.commit(
+						() => ({
+							status: "sleeping",
+							checkpoint: { phase: "parked" },
+							until: 200,
+							signals: [Answer.key("same")],
+						}),
+						ctx,
+					);
+				},
+				parked: async () => {
+					throw new Error("business sleep resumed");
+				},
+			},
+			abort: async (task, runtime, ctx) => {
+				const wake = task.state.wake;
+				if (wake === undefined) {
+					expect(await runtime.readSignal(Answer, "stored", ctx)).toEqual({
+						kind: "value",
+						value: { text: "business" },
+					});
+					expect(await runtime.readSignal(CancelAnswer, "stored", ctx)).toEqual({
+						kind: "value",
+						value: { text: "cancel" },
+					});
+					await expect(
+						runtime.commit(
+							() => ({
+								status: "sleeping",
+								checkpoint: task.state.checkpoint,
+								signals: [CancelAnswer.key("same"), Answer.key("same")],
+							}),
+							ctx,
+						),
+					).rejects.toThrow(/wrong delivery scope/);
+					await runtime.commit(async (tx) => {
+						expect(await tx.signal(task.id, CancelAnswer, "self", { text: "self" })).toBe("delivered");
+						return {
+							status: "sleeping",
+							checkpoint: task.state.checkpoint,
+							until: 200,
+							signals: [CancelAnswer.key("self"), CancelAnswer.key("same")],
+						};
+					}, ctx);
+					return;
+				}
+				expect(wake).toEqual({ reason: "signal", signal: Answer.name, key: "self" });
+				expect(await runtime.readSignal(CancelAnswer, "same", ctx)).toEqual({
+					kind: "value",
+					value: { text: "early" },
+				});
+				await expect(
+					runtime.commit(
+						() => ({
+							status: "sleeping",
+							checkpoint: task.state.checkpoint,
+							signals: [CancelAnswer.key("self")],
+						}),
+						ctx,
+					),
+				).rejects.toThrow(/already woke a wait/);
+				await runtime.commit(() => abortedWith("confirmed"), ctx);
+			},
+		});
+		const storage = new ControlledStorage();
+		const options = { now: () => clock, onWake: () => {} };
+		({ harness } = await openTasks(storage, [Task], options));
+		const root = await harness.root(context);
+		const id = await root.commit((tx) => tx.createTask(Task, null, { ownership: { kind: "conversation" } }), context);
+		expect(await harness.signal(id, CancelAnswer, "same", { text: "too soon" }, context)).toBe("closed");
+		expect(await harness.signal(id, Answer, "stored", { text: "business" }, context)).toBe("delivered");
+		harness.resume();
+		await eventually(() => !harness.wake().active);
+		expect(await statusOf(harness, id)).toBe("sleeping");
+		await harness.close(context);
+		clock = 201;
+		({ harness } = await openTasks(storage.reopen(), [Task], options));
+		await harness.abortTask(id, context);
+		expect((await harness.inspect(context)).scheduling).toBe("paused");
+		const early = await harness.commit(
+			(tx) =>
+				Promise.all([
+					tx.signal(id, Answer, "same", { text: "late business" }),
+					tx.signal(id, CancelAnswer, "same", { text: "early" }),
+					tx.signal(id, CancelAnswer, "same", { text: "duplicate" }),
+					tx.signal(id, CancelAnswer, "stored", { text: "cancel" }),
+				]),
+			context,
+		);
+		expect(early).toEqual(["closed", "delivered", "duplicate", "delivered"]);
+		expect((await harness.waitForTask(id, context)).state.outcome).toEqual({
+			status: "aborted",
+			reason: "confirmed",
+		});
+		expect(await harness.signal(id, CancelAnswer, "same", { text: "settled" }, context)).toBe("closed");
+		await harness.close(context);
+	});
+
+	// #12090
+	it.each([
+		{ sentAt: 199, delivery: "delivered", reason: "signal" },
+		{ sentAt: 200, delivery: "closed", reason: "expired" },
+	])("decides confirmation sent at $sentAt before a later reservation", async ({ sentAt, delivery, reason }) => {
+		let clock = 100;
+		const Task = defineTask<null, { phase: "run" }, string>({
+			name: "test.cancel-deadline",
+			version: 1,
+			initial: () => ({ phase: "run" }),
+			phases: {
+				run: async () => {
+					throw new Error("business ran");
+				},
+			},
+			abort: async (task, runtime, ctx) => {
+				if (task.state.wake === undefined) {
+					await runtime.commit(
+						() => ({
+							status: "sleeping",
+							checkpoint: task.state.checkpoint,
+							until: 200,
+							signals: [CancelAnswer.key("confirm")],
+						}),
+						ctx,
+					);
+					return;
+				}
+				if (task.state.wake.reason === "expired") {
+					expect(await runtime.readSignal(CancelAnswer, "confirm", ctx)).toEqual({ kind: "expired" });
+					await expect(
+						runtime.commit(
+							() => ({
+								status: "sleeping",
+								checkpoint: task.state.checkpoint,
+								signals: [CancelAnswer.key("confirm")],
+							}),
+							ctx,
+						),
+					).rejects.toThrow(/expired/);
+				}
+				await runtime.commit(() => abortedWith(task.state.wake!.reason), ctx);
+			},
+		});
+		const storage = new ControlledStorage();
+		const options = { now: () => clock, onWake: () => {} };
+		let { harness } = await openTasks(storage, [Task], options);
+		const root = await harness.root(context);
+		const id = await root.commit((tx) => tx.createTask(Task, null, { ownership: { kind: "conversation" } }), context);
+		await harness.abortTask(id, context);
+		harness.resume();
+		await eventually(() => !harness.wake().active);
+		expect(harness.wake()).toEqual({ active: false, at: 200 });
+		await harness.close(context);
+		({ harness } = await openTasks(storage.reopen(), [Task], options));
+		clock = sentAt;
+		expect(await harness.commit((tx) => tx.signal(id, CancelAnswer, "confirm", { text: "stop" }), context)).toBe(
+			delivery,
+		);
+		clock = 250;
+		expect((await harness.waitForTask(id, context)).state.outcome).toEqual({ status: "aborted", reason });
+		await harness.close(context);
 	});
 });
 

@@ -820,6 +820,71 @@ export function createStorageConformance(options: StorageConformanceOptions): re
 			expect(await scan("waiting")).toEqual([tasks[2]]);
 		}),
 
+		// #12090
+		createCase(options, "round-trips cancellation parks and terminal cancellation diagnostics", async (storage) => {
+			const rootId = await createRoot(storage);
+			const parentId = await storage.mintId<TaskId<JsonValue>>();
+			const id = await storage.mintId<TaskId<JsonValue>>();
+			const parent = pendingTask(parentId, rootId);
+			const diagnostic = { severity: "error", code: "cancel_unconfirmed", message: "Remote job state is unknown" };
+			const base = {
+				...pendingTask(id, rootId),
+				kind: "pi.tool",
+				version: 5,
+				owner: parentId,
+				abortRequested: true,
+			};
+			const checkpoint = {
+				phase: "parked",
+				arguments: {},
+				replay: "unsafe",
+				checkpoint: { job: "build" },
+				cancellation: { checkpoint: { request: "stop" }, diagnostics: [diagnostic] },
+			};
+			const memo = "pi.cancel-signal.app.confirm/same";
+			const confirmation = { version: 1, value: { stopped: true } };
+			const sleeping: StoredTask = {
+				...base,
+				state: {
+					status: "sleeping",
+					mode: "abort",
+					checkpoint,
+					until: 1_000,
+					signals: [{ delivery: "cancellation", signal: "app.confirm", key: "same" }],
+				},
+				memos: { [memo]: confirmation, "pi.signal.app.confirm/same": { version: 1, value: { stopped: false } } },
+			};
+			await commitWrites(
+				storage,
+				[
+					{ type: "task", value: parent },
+					{ type: "task", value: sleeping },
+				],
+				context,
+			);
+			expect(await storage.task(id, context)).toEqual(sleeping);
+			expect(
+				(await storage.scanTasks({ status: "sleeping", abortRequested: true }, 10, undefined, context)).items,
+			).toEqual([sleeping]);
+			const running: StoredTask = {
+				...base,
+				state: { status: "running", checkpoint, wake: { reason: "signal", signal: "app.confirm", key: "same" } },
+				memos: { ...sleeping.memos, [memo]: { ...confirmation, consumed: true } },
+			};
+			await commitWrites(storage, [{ type: "task", value: running }], context);
+			expect(await storage.task(id, context)).toEqual(running);
+			const terminal: StoredTask = {
+				...base,
+				state: {
+					status: "terminal",
+					outcome: { status: "aborted", result: { kind: "nested", cancellationDiagnostics: [diagnostic] } },
+				},
+			};
+			await commitWrites(storage, [{ type: "task", value: terminal }], context);
+			expect(await storage.task(id, context)).toEqual(terminal);
+			expect((await storage.scanTasks({ status: "sleeping" }, 10, undefined, context)).items).toEqual([]);
+		}),
+
 		createCase(
 			options,
 			"indexes request IDs per conversation and replaces complete submission records",

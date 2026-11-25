@@ -11,6 +11,7 @@ import {
 	observation,
 	type SessionImpl,
 } from "../session/session.ts";
+import type { SignalKey } from "../signals.ts";
 import type {
 	ConversationId,
 	JoinPolicy,
@@ -38,7 +39,8 @@ export type TaskGraphState =
 			readonly status: "sleeping";
 			readonly phase: string;
 			readonly until?: number;
-			readonly signals?: readonly { readonly signal: string; readonly key: string }[];
+			readonly signals?: readonly Pick<SignalKey<unknown>, "signal" | "key" | "delivery">[];
+			readonly mode?: "abort";
 	  }
 	/** Outcome held until its ordinary owned work drains. */
 	| { readonly status: "completing"; readonly outcome: TaskOutcome<JsonValue>["status"] };
@@ -309,9 +311,16 @@ function stateOf(record: AnyTaskRecord): TaskGraphState {
 				status: "sleeping",
 				phase: phaseOf(state.checkpoint),
 				...(state.until === undefined ? {} : { until: state.until }),
+				...(state.mode === undefined ? {} : { mode: state.mode }),
 				...(state.signals === undefined
 					? {}
-					: { signals: state.signals.map(({ signal, key }) => ({ signal, key })) }),
+					: {
+							signals: state.signals.map(({ signal, key, delivery }) => ({
+								signal,
+								key,
+								...(delivery === undefined ? {} : { delivery }),
+							})),
+						}),
 			};
 		// Terminal records never reach here: they leave the graph.
 		case "completing":

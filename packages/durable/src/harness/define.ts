@@ -18,12 +18,13 @@ export function defineExtension<Tool extends ToolRegistration = ToolRegistration
 	return extension;
 }
 
-/** Identity function that types a tool: `args` from `parameters`, details from what it reports, `C` its park checkpoint. */
+/** Identity function that types a tool's arguments, details, execution checkpoint and cancellation checkpoint. */
 export function defineTool<
 	TParameters extends object,
 	TDetails extends JsonValue = JsonValue,
 	C extends JsonValue = JsonValue,
->(tool: ToolRegistration<TParameters, TDetails, C>): ToolRegistration<TParameters, TDetails, C> {
+	K extends JsonValue = JsonValue,
+>(tool: ToolRegistration<TParameters, TDetails, C, K>): ToolRegistration<TParameters, TDetails, C, K> {
 	return tool;
 }
 
@@ -51,7 +52,8 @@ export function hookTask<I extends JsonValue, S extends { phase: string }, R, H 
 
 /**
  * Wrap the tool named like `tool` wherever the wrapping extension is selected. Wrappers never park: one passes `api` to
- * its base unchanged or spread and returns the base's park unchanged; a park of its own ends the call `invalid_park`.
+ * its base unchanged or spread and returns the base's park unchanged, for both execution and cancellation. A park of
+ * its own ends the call with `invalid_park` or `invalid_cancel_park`.
  */
 export function wrapTool<Tool extends ToolRegistration>(tool: Tool, wrapper: (tool: Tool) => Tool): Wrap<Tool> {
 	return { kind: "tool", tool: tool.name, wrap: wrapper };

@@ -23,6 +23,7 @@ import type {
 	ConversationId,
 	EntryId,
 	JsonObject,
+	RunningTask,
 	Task,
 	TaskId,
 	TaskOptions,
@@ -51,12 +52,14 @@ import {
 	type ToolSlot,
 	toolSlot,
 } from "./live.ts";
-import { BASE_PARKS, isPark, type ParkCarrier, parkError } from "./parks.ts";
+import { BASE_CANCEL_PARKS, BASE_PARKS, type CancelParkCarrier, cancelParkError, isPark, parkError } from "./parks.ts";
 import { closeSignal } from "./scheduler.ts";
 import type {
 	GateSleep,
 	NestedToolCall,
 	NestedToolExecutionResult,
+	ToolCancelApi,
+	ToolCancelPark,
 	ToolControl,
 	ToolDiagnostic,
 	ToolExecutionApi,
@@ -100,15 +103,23 @@ export type ToolTaskCheckpoint =
 	 */
 	| { phase: "execute"; arguments: JsonObject; replay: "safe" | "unsafe"; wake?: WakeReason; checkpoint?: JsonValue }
 	/** The call is parked: the `sleeping` or `waiting` state holds this checkpoint (spec suspendable §4.2). */
-	| { phase: "parked"; arguments: JsonObject; replay: "safe" | "unsafe"; checkpoint?: JsonValue };
+	| {
+			phase: "parked";
+			arguments: JsonObject;
+			replay: "safe" | "unsafe";
+			checkpoint?: JsonValue;
+			cancellation?: { checkpoint?: JsonValue; diagnostics?: readonly ToolDiagnostic[] };
+	  };
 
 /**
  * A model-issued call's result is its transcript entry; a nested call's result is in its caller's
- * `NestedCallDoc`, so the receipt stays small and the result retires with the caller. A version 1 task that was
+ * `NestedCallDoc`, which retires with the caller. The receipt retains cancellation diagnostics. A version 1 task that was
  * already holding its outcome as `completing` when the Harness upgraded finishes with a version 1 result,
  * `{ entryId, control? }` without `kind`; treat a result without `kind` as a model-issued call's.
  */
-export type ToolTaskResult = { kind: "model"; entryId: EntryId; control?: ToolControl } | { kind: "nested" };
+export type ToolTaskResult =
+	| { kind: "model"; entryId: EntryId; control?: ToolControl }
+	| { kind: "nested"; cancellationDiagnostics?: readonly ToolDiagnostic[] };
 
 /**
  * Memo of a tool task that made a nested call, in any attempt, committed before the first admission of each attempt:
@@ -155,10 +166,10 @@ type Content = (TextContent | ImageContent)[];
  */
 export const ToolTask = defineTask<ToolTaskInput, ToolTaskCheckpoint, ToolTaskResult, ToolHooks>({
 	name: "pi.tool",
-	version: 4,
+	version: 5,
 	initial: () => ({ phase: "call" }),
 	// Version 1 had only model-issued calls, without `kind`; version 3 added `unoffered`, absent in version 2 inputs;
-	// version 4 added `parked` and the optional fields of `execute`, absent in older checkpoints.
+	// Version 4 added `parked` and resumed execution. Version 5 adds an optional cancellation continuation.
 	migrate: (input, checkpoint, fromVersion) => ({
 		input:
 			fromVersion === 1
@@ -258,7 +269,7 @@ export const ToolTask = defineTask<ToolTaskInput, ToolTaskCheckpoint, ToolTaskRe
 			}
 			// A woken run may have restarted external work that nothing will collect now.
 			if (wake !== undefined && tool !== undefined)
-				await cancel(runtime, task.input, call, tool, args, checkpoint, context);
+				await runCleanup("interrupted", runtime, task.input, call, tool, args, checkpoint, context);
 			const message = `Tool ${call.name} was interrupted and may have partially run`;
 			// `failed` records cancellation intent, so the call's owned conversations, left unsupervised, are aborted.
 			const ending = { status: "failed", message } as const;
@@ -266,37 +277,7 @@ export const ToolTask = defineTask<ToolTaskInput, ToolTaskCheckpoint, ToolTaskRe
 			await settleFromSlot(runtime, task.input, call, { tool }, ending, "interrupted", message, context);
 		},
 	},
-	abort: async (task, runtime, context) => {
-		const call = await readCall(runtime, task.input, context);
-		const checkpoint = task.state.checkpoint;
-		// Abandoned after a restart (`TaskOptions.abandonOnRestart`): say whether the call may have run. An unoffered call
-		// could not run in any case, and its result says so.
-		const [code, message] = isUnoffered(task.input)
-			? ["tool_unavailable", `Tool ${call.name} is not available`]
-			: task.abortReason !== "restart"
-				? ["aborted", `Tool ${call.name} was aborted`]
-				: checkpoint.phase === "execute"
-					? ["interrupted", `Tool ${call.name} was interrupted by a restart and may have partially run`]
-					: checkpoint.phase === "parked"
-						? ["abandoned", `Tool ${call.name} was parked: its caller ended with a restart`]
-						: ["abandoned", `Tool ${call.name} was not started: its caller ended with a restart`];
-		const tool = await toolForLimits(runtime, task.input, call.name, context);
-		// External work may be live while no code of the tool runs: parked, or woken and cut off before it parked again.
-		// The scheduler ends an abort handler cut off `restartLimit` times itself, so `cancel` cannot keep it from ending.
-		if (checkpoint.phase === "parked" || (checkpoint.phase === "execute" && checkpoint.wake !== undefined)) {
-			if (tool !== undefined) {
-				await cancel(runtime, task.input, call, tool, checkpoint.arguments, checkpoint.checkpoint, context);
-			} else {
-				runtime.report(
-					new Error(`Tool ${call.name} is not available: its parked call ${call.id} was not cancelled`),
-				);
-			}
-		}
-		// The scheduler faults the task without a result when its last abort attempt is cut off. That attempt skips the
-		// hooks, which may be what cuts it off.
-		const hooks = (task.restarts ?? 0) < runtime.settings.restartLimit - 1 ? { tool } : undefined;
-		await settleFromSlot(runtime, task.input, call, hooks, { status: "aborted" }, code, message, context);
-	},
+	abort: runCancellation,
 });
 
 /**
@@ -431,20 +412,27 @@ async function settleFromSlot(
 	code: string,
 	message: string,
 	context: Context,
+	cancellation?: { readonly diagnostics?: readonly ToolDiagnostic[]; readonly details?: JsonValue },
 ): Promise<void> {
 	const live = await runtime.snapshot(LiveDoc, runtime.conversationId, context);
-	const { result, truncation } = fromSlot(
+	const { result: partial, truncation } = fromSlot(
 		live === undefined ? undefined : toolSlot(live, runtime.taskId),
 		code,
 		message,
 	);
+	const result = cancellation?.details === undefined ? partial : { ...partial, details: cancellation.details };
 	const settled =
 		hooks !== undefined
 			? await afterHarnessResult(runtime, input, call, hooks.tool, result, truncation, context)
 			: truncation === undefined
 				? result
 				: { ...result, diagnostics: [...(result.diagnostics ?? []), truncation] };
-	await settle(runtime, input, call, ending, settled, context);
+	const cancellationDiagnostics = cancellation?.diagnostics;
+	const final =
+		cancellationDiagnostics === undefined || cancellationDiagnostics.length === 0
+			? settled
+			: { ...settled, diagnostics: mergeDiagnostics(settled.diagnostics, cancellationDiagnostics) };
+	await settle(runtime, input, call, ending, final, context, undefined, cancellationDiagnostics);
 }
 
 /**
@@ -561,6 +549,8 @@ async function run(
 	context: Context,
 ): Promise<void> {
 	const attempt = await startAttempt(runtime, input, call, tool, resumed, context);
+	const baseParks = new Set<ToolPark>();
+	Object.assign(attempt.api, { [BASE_PARKS]: baseParks });
 	let returned: ToolExecutionResult | ToolPark;
 	let ending = COMPLETED;
 	// Execution time of this attempt, for a record without `startedAt` (`settle()`).
@@ -588,7 +578,7 @@ async function run(
 	const pending = await attempt.end();
 	try {
 		if (isPark(returned)) {
-			const invalid = await park(runtime, input, call, tool, args, returned, attempt, context);
+			const invalid = await park(runtime, input, call, tool, args, returned, attempt.reported, baseParks, context);
 			if (invalid === undefined) {
 				for (const waiter of pending) waiter.resolve();
 				return;
@@ -607,7 +597,7 @@ async function run(
 
 /** One run of a tool's code (`execute()` or `cancel`): its api, what it reported, and its progress commits. */
 type Attempt = {
-	readonly api: ToolExecutionApi & ParkCarrier;
+	readonly api: ToolExecutionApi;
 	readonly reported: Reported;
 	readonly progress: Progress;
 	/** Built for this run with `HarnessOptions.env`, so a rerun after recovery gets the conversation's at that time. */
@@ -661,8 +651,7 @@ async function startAttempt(
 		if (resumed.wake !== undefined) throw new Error(`Tool call ${call.id} needs explicit keys after a wake`);
 		return String(++sequence);
 	};
-	const api: ToolExecutionApi & ParkCarrier = {
-		[BASE_PARKS]: new Set(),
+	const api: ToolExecutionApi = {
 		taskId: runtime.taskId,
 		conversationId: runtime.conversationId,
 		callId: call.id,
@@ -834,11 +823,11 @@ async function park(
 	tool: ToolRegistration,
 	args: JsonObject,
 	returned: ToolPark,
-	attempt: Attempt,
+	reported: Reported,
+	baseParks: ReadonlySet<ToolPark>,
 	context: Context,
 ): Promise<string | undefined> {
-	const { api, reported } = attempt;
-	const shape = parkError(tool, returned, api);
+	const shape = parkError(tool, returned, baseParks);
 	if (shape !== undefined) return shape;
 	if (returned.kind === "wait") {
 		for (const id of returned.on) {
@@ -882,19 +871,152 @@ async function park(
 		// with its checkpoint now, in a context only the Harness's close cancels.
 		const cleanup = withAbortSignal(closeSignal(runtime), withoutAbortSignal(context));
 		if ((await runtime.getTask(runtime.taskId, cleanup))?.abortRequested === true) {
-			await cancel(runtime, input, call, tool, args, checkpoint, cleanup);
+			await runCleanup("refused_park", runtime, input, call, tool, args, checkpoint, cleanup);
 		}
 		throw error;
 	}
 	return undefined;
 }
 
-/**
- * Run the tool's `cancel`, if it has one, to clean up the external work of a call that parked (spec suspendable §4.2):
- * `api.checkpoint` is the last park's, `api.wake` undefined, and the api starts no nested calls or tasks. A throw is
- * reported; the call ends either way.
- */
-async function cancel(
+/** Either persist the tool's next cancellation wait or settle its final result. */
+async function runCancellation(
+	task: RunningTask<ToolTaskInput, ToolTaskCheckpoint, ToolTaskResult>,
+	runtime: Runtime,
+	context: Context,
+): Promise<void> {
+	const input = task.input;
+	const call = await readCall(runtime, input, context);
+	const checkpoint = task.state.checkpoint;
+	const [code, message] = isUnoffered(input)
+		? ["tool_unavailable", `Tool ${call.name} is not available`]
+		: task.abortReason !== "restart"
+			? ["aborted", `Tool ${call.name} was aborted`]
+			: checkpoint.phase === "execute"
+				? ["interrupted", `Tool ${call.name} was interrupted by a restart and may have partially run`]
+				: checkpoint.phase === "parked"
+					? ["abandoned", `Tool ${call.name} was parked: its caller ended with a restart`]
+					: ["abandoned", `Tool ${call.name} was not started: its caller ended with a restart`];
+	const resolved = isUnoffered(input)
+		? { tool: undefined }
+		: await resolveTool(runtime, input, call.name, context).then(
+				(tool) => ({ tool }),
+				() => undefined,
+			);
+	const tool = resolved?.tool;
+	const saved = checkpoint.phase === "parked" ? checkpoint.cancellation : undefined;
+	let diagnostics = saved?.diagnostics;
+	let details: JsonValue | undefined;
+	let pending: PromiseWithResolvers<void>[] = [];
+	try {
+		// Only a previously committed execution park can leave external work for the durable handler.
+		if (checkpoint.phase === "parked" || (checkpoint.phase === "execute" && checkpoint.wake !== undefined)) {
+			const cancel = tool?.cancel;
+			if (tool === undefined || (cancel === undefined && saved !== undefined)) {
+				const message = `Tool ${call.name} cannot resume cancellation of ${call.id}: external cleanup is unconfirmed`;
+				runtime.report(
+					new Error(
+						tool === undefined
+							? `Tool ${call.name} is not available: its parked call ${call.id} was not cancelled`
+							: message,
+					),
+				);
+				diagnostics = mergeDiagnostics(diagnostics, [toolDiagnostic("cancel_unavailable", message)]);
+			} else if (cancel !== undefined) {
+				const wake = task.state.wake;
+				const attempt = await runCancelAttempt(
+					runtime,
+					input,
+					call,
+					tool,
+					cancel,
+					checkpoint.arguments,
+					{
+						reason: "abort",
+						checkpoint: checkpoint.checkpoint,
+						cancelCheckpoint: saved?.checkpoint,
+						wake: saved !== undefined && wake?.reason !== "tasks" ? wake : undefined,
+					},
+					context,
+				);
+				pending = attempt.pending;
+				if (input.kind === "model" || input.progress !== false) details = attempt.details;
+				diagnostics = mergeDiagnostics(diagnostics, attempt.diagnostics);
+				if (attempt.kind === "park") {
+					const invalid = await parkCancellation(
+						runtime,
+						checkpoint,
+						attempt.park,
+						{ diagnostics, details },
+						context,
+					);
+					if (invalid === undefined) return;
+					const failure = invalidCancellationPark(call, invalid);
+					await reportToolError(runtime, tool, failure.error, context);
+					diagnostics = mergeDiagnostics(diagnostics, [failure.diagnostic]);
+				}
+			}
+		}
+		// The last attempt skips the hooks, which may be what repeatedly cut the handler off.
+		const hooks = (task.restarts ?? 0) < runtime.settings.restartLimit - 1 ? resolved : undefined;
+		await settleFromSlot(runtime, input, call, hooks, { status: "aborted" }, code, message, context, {
+			diagnostics,
+			details,
+		});
+	} catch (error) {
+		for (const waiter of pending) waiter.reject(error);
+		pending = [];
+		throw error;
+	} finally {
+		for (const waiter of pending) waiter.resolve();
+	}
+}
+
+/** Put the continuation, its wait, and the slot's sleeping state in one commit. */
+async function parkCancellation(
+	runtime: Runtime,
+	checkpoint: Extract<ToolTaskCheckpoint, { phase: "parked" | "execute" }>,
+	{ checkpoint: next, until, signals }: ToolCancelPark,
+	{
+		diagnostics,
+		details,
+	}: { readonly diagnostics: readonly ToolDiagnostic[]; readonly details: JsonValue | undefined },
+	context: Context,
+): Promise<string | undefined> {
+	const parked = {
+		phase: "parked",
+		arguments: checkpoint.arguments,
+		replay: checkpoint.replay,
+		...(checkpoint.checkpoint === undefined ? {} : { checkpoint: checkpoint.checkpoint }),
+		cancellation: {
+			...(next === undefined ? {} : { checkpoint: next }),
+			...(diagnostics.length === 0 ? {} : { diagnostics }),
+		},
+	} as const;
+	try {
+		await runtime.commit(async (tx) => {
+			const slot = toolSlot(await tx.doc(LiveDoc, runtime.conversationId), runtime.taskId);
+			if (slot !== undefined) {
+				if (details !== undefined) assignJson(slot, "details", details);
+				clearOutput(slot);
+				slot.status = "sleeping";
+			}
+			return {
+				status: "sleeping",
+				checkpoint: parked,
+				...(until === undefined ? {} : { until }),
+				...(signals === undefined ? {} : { signals }),
+			};
+		}, context);
+	} catch (error) {
+		if (closeSignal(runtime).aborted || context.abortSignal?.aborted === true) throw error;
+		return errorMessage(error);
+	}
+	return undefined;
+}
+
+/** Best-effort cleanup by a normal invocation. A returned park is reported and discarded. */
+async function runCleanup(
+	reason: "interrupted" | "refused_park",
 	runtime: Runtime,
 	input: ToolTaskInput,
 	call: ToolHookCall,
@@ -903,28 +1025,123 @@ async function cancel(
 	checkpoint: JsonValue | undefined,
 	context: Context,
 ): Promise<void> {
-	if (tool.cancel === undefined) return;
-	const attempt = await startAttempt(
-		runtime,
-		input,
-		call,
-		tool,
-		checkpoint === undefined ? {} : { checkpoint },
-		context,
-	);
+	const cancel = tool.cancel;
+	if (cancel !== undefined) {
+		const attempt = await runCancelAttempt(
+			runtime,
+			input,
+			call,
+			tool,
+			cancel,
+			args,
+			{
+				reason,
+				checkpoint,
+				cancelCheckpoint: undefined,
+				wake: undefined,
+			},
+			context,
+		);
+		for (const waiter of attempt.pending) waiter.resolve();
+	}
+}
+
+type CancelProgress =
+	| Pick<Extract<ToolCancelApi, { reason: "abort" }>, "reason" | "checkpoint" | "cancelCheckpoint" | "wake">
+	| Pick<
+			Extract<ToolCancelApi, { reason: "interrupted" | "refused_park" }>,
+			"reason" | "checkpoint" | "cancelCheckpoint" | "wake"
+	  >;
+
+type CancelAttemptResult = {
+	readonly diagnostics: readonly ToolDiagnostic[];
+	readonly details: JsonValue | undefined;
+	readonly pending: PromiseWithResolvers<void>[];
+} & ({ readonly kind: "settle" } | { readonly kind: "park"; readonly park: ToolCancelPark });
+
+/** Run one cancel callback through the same attempt and environment lifecycle as execute. */
+async function runCancelAttempt(
+	runtime: Runtime,
+	input: ToolTaskInput,
+	call: ToolHookCall,
+	tool: ToolRegistration,
+	cancel: NonNullable<ToolRegistration["cancel"]>,
+	args: JsonObject,
+	progress: CancelProgress,
+	context: Context,
+): Promise<CancelAttemptResult> {
+	let attempt: Attempt | undefined;
+	let park: ToolCancelPark | undefined;
+	let failure: { readonly error: unknown; readonly diagnostic: ToolDiagnostic } | undefined;
 	const refused = (): never => {
 		throw new Error(`Tool ${call.name} cannot start nested calls or tasks in cancel`);
 	};
 	try {
+		attempt = await startAttempt(runtime, input, call, tool, {}, context);
 		attempt.env = await runtime.env(context);
-		// Spread once the environment is built: the copy reads the getters once.
-		await tool.cancel(args, { ...attempt.api, executeTool: refused, createTask: refused }, context);
+		const api: ToolCancelApi & CancelParkCarrier & Pick<ToolExecutionApi, "createTask" | "executeTool"> = {
+			...attempt.api,
+			...progress,
+			[BASE_CANCEL_PARKS]: new Set<ToolCancelPark>(),
+			executeTool: refused,
+			createTask: refused,
+		};
+		const returned = await cancel.call(tool, args, api, context);
+		if (returned !== undefined) {
+			const invalid =
+				progress.reason === "abort"
+					? cancelParkError(tool, returned, api)
+					: `cannot park during ${progress.reason} cleanup`;
+			if (invalid === undefined) {
+				park = returned;
+			} else {
+				failure = invalidCancellationPark(call, invalid);
+			}
+		}
 	} catch (error) {
-		// Only the Harness's close cancels a cleanup.
-		if (context.abortSignal?.aborted === true) throw error;
-		await reportToolError(runtime, tool, error, context);
+		failure = { error, diagnostic: toolDiagnostic("cancel_error", errorMessage(error)) };
 	}
-	for (const waiter of await attempt.end()) waiter.resolve();
+	const pending = attempt === undefined ? [] : await attempt.end();
+	try {
+		closeSignal(runtime).throwIfAborted();
+		context.abortSignal?.throwIfAborted();
+		const diagnostics = attempt?.reported.diagnostics ?? [];
+		if (failure !== undefined) {
+			await reportToolError(runtime, tool, failure.error, context);
+			diagnostics.push(failure.diagnostic);
+		}
+		const reported = { diagnostics, details: attempt?.reported.details, pending };
+		return park === undefined ? { kind: "settle", ...reported } : { kind: "park", park, ...reported };
+	} catch (error) {
+		for (const waiter of pending) waiter.reject(error);
+		throw error;
+	}
+}
+
+function invalidCancellationPark(call: ToolHookCall, reason: string): { error: Error; diagnostic: ToolDiagnostic } {
+	const message = `Tool ${call.name} returned an invalid cancellation park: ${reason}`;
+	return {
+		error: new Error(`invalid_cancel_park: ${message}`),
+		diagnostic: toolDiagnostic("invalid_cancel_park", message),
+	};
+}
+
+/** Add cancellation evidence missing from the slot, checkpoint or hook result. */
+function mergeDiagnostics(
+	existing: readonly ToolDiagnostic[] | undefined,
+	cancellation: readonly ToolDiagnostic[],
+): readonly ToolDiagnostic[] {
+	const merged = [...(existing ?? [])];
+	for (const diagnostic of cancellation) {
+		if (
+			!merged.some(
+				({ severity, code, message }) =>
+					severity === diagnostic.severity && code === diagnostic.code && message === diagnostic.message,
+			)
+		)
+			merged.push(diagnostic);
+	}
+	return merged;
 }
 
 /**
@@ -1165,6 +1382,7 @@ async function settle(
 	result: ToolExecutionResult,
 	context: Context,
 	measured?: number,
+	cancellationDiagnostics?: readonly ToolDiagnostic[],
 ): Promise<void> {
 	// A crash in between leaves the call in `execute`: a safe rerun reattaches to the calls, an interruption ends here.
 	// Every live nested call the task owns, also those an earlier attempt made and this one never called again.
@@ -1195,7 +1413,12 @@ async function settle(
 				finishSlot(found.slot);
 				found.slot.summary = summaryOf(nested, result.output ?? []);
 			}
-			settled = { kind: "nested" };
+			settled = {
+				kind: "nested",
+				...(cancellationDiagnostics === undefined || cancellationDiagnostics.length === 0
+					? {}
+					: { cancellationDiagnostics }),
+			};
 		} else {
 			const timing = { timestamp: runtime.now(), durationMs };
 			const entry = await appendToolResult(tx, conversationId, call, result, timing);

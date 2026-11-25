@@ -281,6 +281,31 @@ export type ToolPark<C extends JsonValue = JsonValue> = NoResultFields &
 /** A park carries no result field, so code reading a result's fields reads none from a park. */
 type NoResultFields = { readonly [K in Exclude<keyof ToolExecutionResult, "kind">]?: never };
 
+/** A cancellation wait for signals scoped to cancellation, a deadline, or both. */
+export type ToolCancelPark<K extends JsonValue = JsonValue> = Extract<ToolPark<K>, { readonly kind: "sleep" }>;
+
+/** Wakes a cancellation handler can receive from its own sleep. */
+type CancellationWake = Extract<WakeReason, { readonly reason: "signal" | "time" | "expired" }>;
+
+/** Operations and saved progress of one cancellation or temporary cleanup attempt. */
+export type ToolCancelApi<
+	D extends JsonValue = JsonValue,
+	C extends JsonValue = JsonValue,
+	K extends JsonValue = JsonValue,
+> = Omit<ToolExecutionApi<D, C>, "executeTool" | "createTask" | "wake"> &
+	(
+		| {
+				readonly reason: "abort";
+				readonly cancelCheckpoint: K | undefined;
+				readonly wake: CancellationWake | undefined;
+		  }
+		| {
+				readonly reason: "interrupted" | "refused_park";
+				readonly cancelCheckpoint: undefined;
+				readonly wake: undefined;
+		  }
+	);
+
 /** Whether the tools of one round run at once or one after another in call order. */
 export type ToolExecutionMode = "parallel" | "sequential";
 
@@ -297,7 +322,7 @@ export interface ToolExecutionApi<TDetails extends JsonValue = JsonValue, C exte
 	readonly taskId: TaskId;
 	readonly conversationId: ConversationId;
 	readonly callId: string;
-	/** Why this run started after a park; undefined on a fresh call, and in `cancel`. */
+	/** Why this execution started after a park; undefined on a fresh call. */
 	readonly wake: WakeReason | undefined;
 	/** What the call last parked with; undefined on a fresh call or after a park without one. */
 	readonly checkpoint: C | undefined;
@@ -373,8 +398,8 @@ export interface ToolExecutionApi<TDetails extends JsonValue = JsonValue, C exte
 	 *
 	 * `progress: false` commits no running output, details, or diagnostics to the nested call's slot, only its status;
 	 * the result still carries its details and diagnostics, and a schema-less tool's output as `structuredOutput`. An
-	 * interrupted or aborted call's result is built from its slot, so it then has none of them. Either way, programs never
-	 * get the partial output of an interrupted or aborted call.
+	 * interrupted or aborted call's result is built from its slot. Diagnostics from durable cancellation still reach the
+	 * result and the nested task's receipt. Programs never get the partial output of an interrupted or aborted call.
 	 *
 	 * Nested calls run as soon as they are made, whatever their `executionMode`; the caller decides what runs at once by
 	 * what it awaits. Cancelling `context` stops only the wait; the nested call runs on. When this call settles, nested
@@ -420,12 +445,13 @@ type IsAny<T> = boolean extends (T extends never ? true : false) ? true : false;
 /**
  * Executable tool registered in a registry. Only pi-ai `Tool` fields enter the transcript. `args` are typed by
  * `parameters` (any JSON Schema object; see {@link ToolArgs}), which the Harness validates them against before
- * `execute()`; `defineTool()` infers both generics.
+ * `execute()`; `defineTool()` also preserves the details, execution checkpoint and cancellation checkpoint types.
  */
 export type ToolRegistration<
 	TParameters extends object = object,
 	TDetails extends JsonValue = JsonValue,
 	C extends JsonValue = JsonValue,
+	K extends JsonValue = JsonValue,
 > = Tool<TParameters> & {
 	/** Whether an interrupted execution may rerun on recovery. Default `unsafe`. */
 	readonly replay?: "safe" | "unsafe";
@@ -465,11 +491,17 @@ export type ToolRegistration<
 		context: Context,
 	): Promise<ToolExecutionResult<TDetails> | ToolPark<C>>;
 	/**
-	 * Clean up the external work of a call that parked, when it is aborted while no code of the tool runs (spec
-	 * suspendable §4.2): `api.checkpoint` is the last park's, `api.wake` undefined, and it starts no nested calls or
-	 * tasks. May run more than once, so idempotent. A throw is reported and the call still ends.
+	 * Clean up external work of a call that parked. With reason `abort`, return a sleep to save cancellation progress,
+	 * or return void to finish. Temporary cleanup after an interruption or a refused execution park must return void.
+	 * `api.checkpoint` holds the business checkpoint (the refused park's value for `refused_park`). Cancellation can run
+	 * more than once after a restart, so use idempotent effects.
 	 */
-	cancel?(args: ToolArgs<TParameters>, api: ToolExecutionApi<TDetails, C>, context: Context): Promise<void>;
+	cancel?(
+		args: ToolArgs<TParameters>,
+		api: ToolCancelApi<TDetails, C, K>,
+		context: Context,
+		// biome-ignore lint/suspicious/noConfusingVoidType: cancellation handlers can finish without a return statement.
+	): Promise<void | ToolCancelPark<K>>;
 };
 
 /** Input to system prompt section rendering for one request preparation. */
@@ -865,6 +897,7 @@ export type HarnessOptions<Tool extends ToolRegistration = ToolRegistration> = {
  * example by a recovery alarm. `at`: the earliest sleep not yet due,
  * when there is one. Neither: nothing needs a process until new work is submitted. Tasks blocked on a missing or
  * unmigratable definition, `completing` tasks, and waits on live tasks do not count; the work they wait for does.
+ * Cancellation sleeps contribute a deadline like ordinary sleeps, and count as unfinished work for idle waits.
  */
 export type Wake = { readonly active: boolean; readonly at?: number };
 
@@ -872,7 +905,7 @@ export type Wake = { readonly active: boolean; readonly at?: number };
 export type TaskInspection = {
 	readonly record: TaskRecord<JsonValue, JsonValue, JsonValue>;
 	readonly state: /** An invocation is active. */
-		| { readonly kind: "running" }
+		| { readonly kind: "running"; readonly mode: "run" | "abort" }
 		/** The next scheduling pass reserves it; `migrates` when its definition is newer and has `migrate`. */
 		| { readonly kind: "pending"; readonly migrates: boolean }
 		/**
@@ -881,7 +914,7 @@ export type TaskInspection = {
 		 */
 		| { readonly kind: "waiting"; readonly on: readonly TaskId[] }
 		/** Sleeps until the Harness clock reaches `until`, if set, or a signal it sleeps on arrives. */
-		| { readonly kind: "sleeping"; readonly until?: number }
+		| { readonly kind: "sleeping"; readonly until?: number; readonly mode?: "abort" }
 		/** Outcome held until its ordinary owned work drains. */
 		| { readonly kind: "completing" }
 		/** Cannot run here: no registered definition can take it (aborting it settles it as `orphaned`). */
@@ -1209,7 +1242,8 @@ export interface ToolHooks {
 	 * the scheduler gives an abort handler (restarts at the limit minus one). A result's `structuredOutput` is dropped
 	 * when the Harness wrote it (a nested call a hook turns into a success gets the bounded output as a schema-less tool's
 	 * does), and its `control` applies only to a call that completes (not to an interrupted, cut-off, or aborted one).
-	 * An abort's hooks run inside the abort handler, which cannot be aborted: a slow hook delays `Conversation.abort()`.
+	 * Cancellation runs this hook only when settling, and preserves its diagnostics even if the hook replaces the
+	 * result. Recovery can run the hook again before a result commits. A slow hook delays `Conversation.abort()`.
 	 */
 	afterTool(
 		call: ToolHookCall,

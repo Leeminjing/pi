@@ -6,6 +6,7 @@ import type { JsonValue } from "@earendil-works/chord/json";
 import {
 	type ConversationId,
 	type ConversationView,
+	defineSignal,
 	defineTask,
 	type EntryId,
 	MemoryStorage,
@@ -13,6 +14,7 @@ import {
 	type TaskGraph,
 	type TaskId,
 } from "@earendil-works/pi-durable";
+import { str } from "@earendil-works/pi-schema";
 import { describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { ControlledStorage, context, flush, onValue } from "./session-support.ts";
@@ -83,6 +85,59 @@ function statuses(graph: TaskGraph): Record<string, string> {
 }
 
 describe("task graph view", () => {
+	// #12090
+	it("projects a cancellation wait identically on publication, rebuild and reopen", async () => {
+		const Ack = defineSignal({ name: "test.graph-stop", version: 1, schema: str(), delivery: "cancellation" });
+		const Task = defineTask<null, { phase: "wait" }, null>({
+			name: "test.graph-cancel",
+			version: 1,
+			initial: () => ({ phase: "wait" }),
+			phases: { wait: (_task, runtime) => aborted(runtime.signal) },
+			abort: (task, runtime, ctx) =>
+				runtime.commit(
+					() => ({
+						status: "sleeping",
+						checkpoint: task.state.checkpoint,
+						until: 300,
+						signals: [Ack.key("ack")],
+					}),
+					ctx,
+				),
+		});
+		const storage = new ControlledStorage();
+		const options = { now: () => 100, onWake: () => {} };
+		let { harness } = await openTasks(storage, [Task], options);
+		let graph = await harness.watchTaskGraph(context);
+		let advanced = graph.value;
+		graph.start(
+			onValue(async ({ value }) => {
+				advanced = value;
+			}),
+		);
+		const root = await harness.root(context);
+		const id = await root.commit((tx) => tx.createTask(Task, null, { ownership: { kind: "conversation" } }), context);
+		await harness.abortTask(id, context);
+		harness.resume();
+		await eventually(() => advanced.tasks[String(id)]?.state.status === "sleeping");
+		expect(advanced.tasks[String(id)]?.state).toEqual({
+			status: "sleeping",
+			phase: "wait",
+			until: 300,
+			mode: "abort",
+			signals: [Ack.key("ack")],
+		});
+		await graph.stop();
+		graph = await harness.watchTaskGraph(context);
+		expect(graph.value).toEqual(advanced);
+		await graph.stop();
+		await harness.close(context);
+		({ harness } = await openTasks(storage.reopen(), [Task], options));
+		graph = await harness.watchTaskGraph(context);
+		expect(graph.value).toEqual(advanced);
+		await graph.stop();
+		await harness.close(context);
+	});
+
 	it("follows every live task through its statuses, owner edges, and owned conversations", async () => {
 		const child = deferred();
 		const late = deferred();
