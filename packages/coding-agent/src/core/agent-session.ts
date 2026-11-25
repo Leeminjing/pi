@@ -3664,13 +3664,13 @@ export class AgentSession {
 	}
 
 	private _refreshToolRegistry(options?: { activeToolNames?: string[]; includeAllExtensionTools?: boolean }): void {
-		// Tools that were already activated on registration. A tool whose exposure changes to
-		// `direct` or `model-only` (for example from `hidden`) is activated like a new tool.
-		const previousActivatedOnRegistration = new Set(
-			[...this._toolRegistry.keys()].filter((name) => this._isActivatedOnRegistration(name)),
-		);
-		const previousActiveToolNames = this.getActiveToolNames();
 		const allowedTools = this._allowedTools;
+		// Explicit matches override defaultActive. MCP tools kept registered without a match
+		// do not auto-activate.
+		const shouldActivateOnRegistration = (name: string) =>
+			allowedTools ? allowedTools(name) && this._isDeclarable(name) : this._isActivatedOnRegistration(name);
+		const previousEligibleToolNames = new Set([...this._toolRegistry.keys()].filter(shouldActivateOnRegistration));
+		const previousActiveToolNames = this.getActiveToolNames();
 
 		const registeredTools = this._extensionRunner.getAllRegisteredTools();
 		const allCustomTools = [
@@ -3734,25 +3734,20 @@ export class AgentSession {
 		}
 		this._toolRegistry = toolRegistry;
 
-		const nextActiveToolNames = (
-			options?.activeToolNames ? [...options.activeToolNames] : [...previousActiveToolNames]
-		).filter((name) => this._isAllowedTool(name));
+		const rebuilding = options?.activeToolNames !== undefined;
+		const nextActiveToolNames = (options?.activeToolNames ?? previousActiveToolNames).filter((name) =>
+			this._isAllowedTool(name),
+		);
 
-		if (allowedTools) {
-			for (const toolName of this._toolRegistry.keys()) {
-				// Naming or matching a tool activates it even when it is not active by default. MCP tools
-				// kept registered without being named stay inactive.
-				if (allowedTools(toolName) && this._isDeclarable(toolName)) {
-					nextActiveToolNames.push(toolName);
-				}
-			}
-		} else if (options?.includeAllExtensionTools) {
+		if (!allowedTools && options?.includeAllExtensionTools) {
 			for (const tool of wrappedExtensionTools) {
 				if (this._isActivatedOnRegistration(tool.name)) nextActiveToolNames.push(tool.name);
 			}
-		} else if (!options?.activeToolNames) {
-			for (const toolName of this._toolRegistry.keys()) {
-				if (!previousActivatedOnRegistration.has(toolName) && this._isActivatedOnRegistration(toolName)) {
+		} else if (allowedTools || !rebuilding) {
+			// A dynamic refresh preserves the current selection, adding only tools that just
+			// became eligible, including tools whose exposure changed to direct or model-only.
+			for (const toolName of toolRegistry.keys()) {
+				if ((rebuilding || !previousEligibleToolNames.has(toolName)) && shouldActivateOnRegistration(toolName)) {
 					nextActiveToolNames.push(toolName);
 				}
 			}
